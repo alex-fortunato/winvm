@@ -11,6 +11,7 @@ ISO="${ISO:-$USER_HOME/Downloads/Win10_22H2_English_x64v1.iso}"
 # Attach the installer ISO only when explicitly requested (set ATTACH_ISO=1).
 ATTACH_ISO="${ATTACH_ISO:-0}"
 USB_DEVICES=(${USB_DEVICES:-sdd sde})
+SAMPLES_DISK="${SAMPLES_DISK:-/dev/sda}"
 
 if [[ ! -f "$DIR/$IMG" ]]; then
   echo "Image '$IMG' not found in $DIR" >&2
@@ -190,12 +191,16 @@ tap_note=""
 [[ "$netdev_backend" == "tap" ]] && tap_note=", tap=${TAP_IFACE}"
 log "Network backend: ${netdev_backend} (bridge=${BRIDGE_NAME}${tap_note}), NIC=${NIC_DEVICE}"
 
+[[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
+
 args=(
   -enable-kvm
   -m "$MEM"
   -smp "$CPUS"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
   -drive "file=$DIR/$IMG,if=ide,index=0"
+  # Attach dedicated samples disk (raw block device). Use IDE for out-of-box Windows support.
+  -drive "file=$SAMPLES_DISK,if=ide,index=1,format=raw,cache=none,aio=native"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
   -display gtk
