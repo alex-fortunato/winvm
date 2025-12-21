@@ -26,6 +26,8 @@ MEM="${MEM:-64G}"
 CPUS="${CPUS:-4}"
 # Default to an emulated NIC with built-in Windows drivers; switch to virtio after installing its driver.
 NIC_MODEL="${NIC_MODEL:-e1000}"
+# Audio backend for the virtual HDA device (pa, alsa, sdl, none).
+AUDIO_BACKEND="${AUDIO_BACKEND:-pa}"
 # Network backend: bridge (qemu-bridge-helper), tap, or auto (bridge first, tap fallback).
 NETWORK_MODE="${NETWORK_MODE:-auto}"
 BRIDGE_NAME="${BRIDGE_NAME:-br0}"
@@ -191,6 +193,38 @@ tap_note=""
 [[ "$netdev_backend" == "tap" ]] && tap_note=", tap=${TAP_IFACE}"
 log "Network backend: ${netdev_backend} (bridge=${BRIDGE_NAME}${tap_note}), NIC=${NIC_DEVICE}"
 
+# PulseAudio generally expects a user runtime dir; when running under sudo, default to the invoking user's.
+audio_runtime_dir="${AUDIO_RUNTIME_DIR:-}"
+if [[ -z "$audio_runtime_dir" && -n "${SUDO_USER:-}" ]]; then
+  sudo_uid=$(id -u "$SUDO_USER" 2>/dev/null || true)
+  if [[ -n "$sudo_uid" && -d "/run/user/$sudo_uid" ]]; then
+    audio_runtime_dir="/run/user/$sudo_uid"
+  fi
+fi
+if [[ -z "$audio_runtime_dir" ]]; then
+  current_uid=$(id -u)
+  if [[ -d "/run/user/$current_uid" ]]; then
+    audio_runtime_dir="/run/user/$current_uid"
+  fi
+fi
+if [[ -n "$audio_runtime_dir" ]]; then
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$audio_runtime_dir}"
+  export PULSE_SERVER="${PULSE_SERVER:-unix:$audio_runtime_dir/pulse/native}"
+  export PULSE_COOKIE="${PULSE_COOKIE:-$audio_runtime_dir/pulse/cookie}"
+  log "Audio runtime: $audio_runtime_dir"
+fi
+
+audio_dev_id="audio0"
+audio_dev=()
+case "$AUDIO_BACKEND" in
+  pa) audio_dev=(-audiodev "pa,id=$audio_dev_id") ;;
+  alsa) audio_dev=(-audiodev "alsa,id=$audio_dev_id") ;;
+  sdl) audio_dev=(-audiodev "sdl,id=$audio_dev_id") ;;
+  none) audio_dev=(-audiodev "none,id=$audio_dev_id") ;;
+  *) die "Unknown AUDIO_BACKEND '$AUDIO_BACKEND' (use pa|alsa|sdl|none)" ;;
+esac
+log "Audio backend: ${AUDIO_BACKEND} (device=ich9-intel-hda)"
+
 [[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
 
 args=(
@@ -207,6 +241,9 @@ args=(
   -vga qxl
   -device virtio-tablet
   -device virtio-keyboard
+  "${audio_dev[@]}"
+  -device ich9-intel-hda
+  -device hda-duplex,audiodev="$audio_dev_id"
   "${netdev_arg[@]}"
   -device "${NIC_DEVICE},netdev=net0"
 )
