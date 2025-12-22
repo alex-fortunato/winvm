@@ -225,6 +225,29 @@ case "$AUDIO_BACKEND" in
 esac
 log "Audio backend: ${AUDIO_BACKEND} (device=ich9-intel-hda)"
 
+GPU_MODEL="${GPU_MODEL:-virtio-gl}"
+display_dev=()
+gpu_dev=()
+case "$GPU_MODEL" in
+  virtio-gl)
+    display_dev=(-display "gtk,gl=on")
+    # Prefer virtio-gpu-pci with virgl since virtio-vga-gl may be unavailable in some QEMU builds.
+    gpu_dev=(-device "virtio-gpu-pci,virgl=on")
+    ;;
+  virtio)
+    display_dev=(-display "gtk")
+    gpu_dev=(-device "virtio-vga")
+    ;;
+  qxl)
+    display_dev=(-display "gtk")
+    gpu_dev=(-vga "qxl")
+    ;;
+  *)
+    die "Unknown GPU_MODEL '$GPU_MODEL' (use virtio-gl|virtio|qxl)"
+    ;;
+esac
+log "Display: ${display_dev[*]/%/,} GPU model: ${gpu_dev[*]}"
+
 [[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
 
 args=(
@@ -237,8 +260,8 @@ args=(
   -drive "file=$SAMPLES_DISK,if=ide,index=1,format=raw,cache=none,aio=native"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
-  -display gtk
-  -vga qxl
+  "${display_dev[@]}"
+  "${gpu_dev[@]}"
   -device virtio-tablet
   -device virtio-keyboard
   "${audio_dev[@]}"
