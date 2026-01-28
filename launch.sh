@@ -23,7 +23,7 @@ if [[ ! -w "$DIR/$IMG" ]]; then
 fi
 
 MEM="${MEM:-64G}"
-CPUS="${CPUS:-4}"
+CPUS="${CPUS:-16}"
 # Default to an emulated NIC with built-in Windows drivers; switch to virtio after installing its driver.
 NIC_MODEL="${NIC_MODEL:-e1000}"
 # Audio backend for the virtual HDA device (pa, alsa, sdl, none).
@@ -269,7 +269,7 @@ fi
 args=(
   -enable-kvm
   -machine q35
-  -cpu host,kvm=off,hv_vendor_id=123456789abc
+  -cpu qemu64,kvm=off,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vendor_id=123456789abc
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -m "$MEM"
