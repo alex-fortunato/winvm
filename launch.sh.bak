@@ -12,6 +12,9 @@ ISO="${ISO:-$USER_HOME/Downloads/Win10_22H2_English_x64v1.iso}"
 ATTACH_ISO="${ATTACH_ISO:-0}"
 USB_DEVICES=(${USB_DEVICES:-sdd sde})
 SAMPLES_DISK="${SAMPLES_DISK:-/dev/sda}"
+DEFAULT_UEFI_PATH="${DEFAULT_UEFI_PATH:-}"
+DEFAULT_PASSTHROUGH_GPU="${DEFAULT_PASSTHROUGH_GPU:-84:00.0}"
+DEFAULT_PASSTHROUGH_GPU_AUDIO="${DEFAULT_PASSTHROUGH_GPU_AUDIO:-84:00.1}"
 
 if [[ ! -f "$DIR/$IMG" ]]; then
   echo "Image '$IMG' not found in $DIR" >&2
@@ -22,8 +25,16 @@ if [[ ! -w "$DIR/$IMG" ]]; then
   exit 1
 fi
 
+UEFI_PATH="${UEFI_PATH:-$DEFAULT_UEFI_PATH}"
+if [[ -n "$UEFI_PATH" && ! -f "$UEFI_PATH" ]]; then
+  die "UEFI path '$UEFI_PATH' not found (set UEFI_PATH or DEFAULT_UEFI_PATH)"
+fi
+
 MEM="${MEM:-64G}"
 CPUS="${CPUS:-4}"
+CPU_MODEL="${CPU_MODEL:-host}"
+CPU_VENDOR_ID="${CPU_VENDOR_ID:-123456789abc}"
+HIDE_HYPERVISOR="${HIDE_HYPERVISOR:-1}"
 # Default to an emulated NIC with built-in Windows drivers; switch to virtio after installing its driver.
 NIC_MODEL="${NIC_MODEL:-e1000}"
 # Audio backend for the virtual HDA device (pa, alsa, sdl, none).
@@ -225,29 +236,59 @@ case "$AUDIO_BACKEND" in
 esac
 log "Audio backend: ${AUDIO_BACKEND} (device=ich9-intel-hda)"
 
-# GPU Passthrough settings
-PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-84:00.0}"
-PASSTHROUGH_GPU_AUDIO="${PASSTHROUGH_GPU_AUDIO:-84:00.1}"
-GPU_MODEL="${GPU_MODEL:-qxl}"
-
+GPU_MODEL="${GPU_MODEL:-virtio-gl}"
+PASSTHROUGH_AUTO="${PASSTHROUGH_AUTO:-1}"
+PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-${VFIO_GPU:-}}"
+PASSTHROUGH_GPU_AUDIO="${PASSTHROUGH_GPU_AUDIO:-${VFIO_GPU_AUDIO:-}}"
+# Allow explicit opt-out with PASSTHROUGH_GPU/PASSTHROUGH_GPU_AUDIO set to "none".
+[[ "${PASSTHROUGH_GPU,,}" == "none" ]] && PASSTHROUGH_GPU=""
+[[ "${PASSTHROUGH_GPU_AUDIO,,}" == "none" ]] && PASSTHROUGH_GPU_AUDIO=""
+if [[ "$PASSTHROUGH_AUTO" != "0" && -z "$PASSTHROUGH_GPU" && -e "/sys/bus/pci/devices/0000:${DEFAULT_PASSTHROUGH_GPU}" ]]; then
+  PASSTHROUGH_GPU="$DEFAULT_PASSTHROUGH_GPU"
+fi
+if [[ "$PASSTHROUGH_AUTO" != "0" && -z "$PASSTHROUGH_GPU_AUDIO" && -e "/sys/bus/pci/devices/0000:${DEFAULT_PASSTHROUGH_GPU_AUDIO}" ]]; then
+  PASSTHROUGH_GPU_AUDIO="$DEFAULT_PASSTHROUGH_GPU_AUDIO"
+fi
+PASSTHROUGH_GPU_MULTIFUNCTION="${PASSTHROUGH_GPU_MULTIFUNCTION:-1}"
+PASSTHROUGH_GPU_X_VGA="${PASSTHROUGH_GPU_X_VGA:-0}"
 display_dev=()
 gpu_dev=()
 
-if [[ -n "$PASSTHROUGH_GPU" && "$PASSTHROUGH_GPU" != "none" ]]; then
-  # GPU passthrough via vfio-pci
-  gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU,multifunction=on")
-  if [[ -n "$PASSTHROUGH_GPU_AUDIO" && "$PASSTHROUGH_GPU_AUDIO" != "none" ]]; then
-    gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU_AUDIO")
+if [[ -n "$PASSTHROUGH_GPU" ]]; then
+  # Host GPU passthrough via vfio-pci (primary display handled by physical outputs).
+  gpu_flags="vfio-pci,host=$PASSTHROUGH_GPU"
+  [[ "$PASSTHROUGH_GPU_MULTIFUNCTION" == "1" ]] && gpu_flags+=",multifunction=on"
+  [[ -n "${PASSTHROUGH_GPU_ROM:-}" ]] && gpu_flags+=",romfile=$PASSTHROUGH_GPU_ROM"
+  [[ "$PASSTHROUGH_GPU_X_VGA" == "1" ]] && gpu_flags+=",x-vga=on"
+  gpu_dev+=(-device "$gpu_flags")
+  if [[ -n "$PASSTHROUGH_GPU_AUDIO" ]]; then
+    audio_flags="vfio-pci,host=$PASSTHROUGH_GPU_AUDIO"
+    [[ "$PASSTHROUGH_GPU_MULTIFUNCTION" == "1" ]] && audio_flags+=",multifunction=on"
+    gpu_dev+=(-device "$audio_flags")
   fi
-  # Use QXL for a management window on the host
-  display_dev=(-display "gtk")
-  gpu_dev+=(-vga "qxl")
-  log "GPU passthrough: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+, audio=$PASSTHROUGH_GPU_AUDIO} (+ QXL for host display)"
+  if [[ "${PASSTHROUGH_KEEP_VDISPLAY:-0}" == "1" ]]; then
+    # Keep a virtual display for management while still passing through the host GPU.
+    display_dev=(-display "gtk")
+    gpu_dev+=(-vga "qxl")
+    log "GPU passthrough + virtual display: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+,+$PASSTHROUGH_GPU_AUDIO}"
+  else
+    # Disable the emulated display; use the physical GPU output.
+    display_dev=(-display "none")
+    log "GPU passthrough: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+,+$PASSTHROUGH_GPU_AUDIO}"
+  fi
 else
   case "$GPU_MODEL" in
     virtio-gl)
-      display_dev=(-display "gtk,gl=on")
-      gpu_dev=(-device "virtio-gpu-pci,virgl=on")
+      supports_virgl() { "$QEMU_BIN" -device virtio-gpu-pci,help 2>/dev/null | grep -q "virgl"; }
+      if supports_virgl; then
+        display_dev=(-display "gtk,gl=on")
+        # Prefer virtio-gpu-pci with virgl since virtio-vga-gl may be unavailable in some QEMU builds.
+        gpu_dev=(-device "virtio-gpu-pci,virgl=on")
+      else
+        warn "virgl not supported by $QEMU_BIN; falling back to virtio"
+        display_dev=(-display "gtk")
+        gpu_dev=(-device "virtio-vga")
+      fi
       ;;
     virtio)
       display_dev=(-display "gtk")
@@ -266,12 +307,15 @@ fi
 
 [[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
 
+cpu_flags="$CPU_MODEL"
+if [[ "$HIDE_HYPERVISOR" == "1" ]]; then
+  cpu_flags+=",kvm=off,hv_vendor_id=$CPU_VENDOR_ID"
+fi
+cpu_arg=(-cpu "$cpu_flags")
+
 args=(
+  "${cpu_arg[@]}"
   -enable-kvm
-  -machine q35
-  -cpu host,kvm=off,hv_vendor_id=123456789abc
-  -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
-  -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -m "$MEM"
   -smp "$CPUS"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
@@ -323,6 +367,12 @@ if [[ ${#USB_DEVICES[@]} -gt 0 ]]; then
       echo "Warning: /dev/$dev not found; skipping" >&2
     fi
   done
+fi
+
+if [[ -n "${EXTRA_ARGS:-}" ]]; then
+  # Allow caller to inject additional QEMU arguments (e.g., GPU passthrough devices)
+  read -r -a extra_args <<<"$EXTRA_ARGS"
+  args+=("${extra_args[@]}")
 fi
 
 exec "$QEMU_BIN" "${args[@]}"
