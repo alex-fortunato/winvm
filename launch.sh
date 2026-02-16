@@ -235,7 +235,7 @@ gpu_dev=()
 
 if [[ -n "$PASSTHROUGH_GPU" && "$PASSTHROUGH_GPU" != "none" ]]; then
   # GPU passthrough via vfio-pci
-  gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU,multifunction=on")
+  gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU,multifunction=on,romfile=$DIR/k620.rom")
   if [[ -n "$PASSTHROUGH_GPU_AUDIO" && "$PASSTHROUGH_GPU_AUDIO" != "none" ]]; then
     gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU_AUDIO")
   fi
@@ -269,7 +269,7 @@ fi
 args=(
   -enable-kvm
   -machine q35
-  -cpu qemu64,kvm=off,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vendor_id=123456789abc
+  -cpu host,kvm=off,hv_vendor_id=whatever
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -m "$MEM"
