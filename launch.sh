@@ -38,9 +38,24 @@ PREFER_VIRTIO_NET="${PREFER_VIRTIO_NET:-0}"
 USB_MODE="${USB_MODE:-block}"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 
+# UEFI firmware (OVMF) – required for GPU passthrough
+OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
+OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
+OVMF_VARS="$DIR/OVMF_VARS.4m.fd"
+# Set FIRMWARE=bios to fall back to legacy SeaBIOS boot
+FIRMWARE="${FIRMWARE:-uefi}"
+
 log() { echo "[winvm] $*"; }
 warn() { echo "[winvm][warn] $*" >&2; }
 die() { echo "[winvm][error] $*" >&2; exit 1; }
+
+if [[ "$FIRMWARE" == "uefi" ]]; then
+  [[ -f "$OVMF_CODE" ]] || die "OVMF_CODE not found at $OVMF_CODE (install edk2-ovmf)"
+  if [[ ! -f "$OVMF_VARS" ]]; then
+    log "Creating per-VM OVMF vars from template: $OVMF_VARS"
+    cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
+  fi
+fi
 
 find_bridge_helper() {
   local helper
@@ -291,8 +306,11 @@ args=(
   -device "${NIC_DEVICE},netdev=net0"
 )
 
-if [[ -n "${UEFI_PATH:-}" ]]; then
-  args+=(-bios "$UEFI_PATH")
+if [[ "$FIRMWARE" == "uefi" ]]; then
+  # pflash: CODE is read-only shared firmware, VARS is per-VM mutable NVRAM
+  args+=(-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE")
+  args+=(-drive "if=pflash,format=raw,file=$OVMF_VARS")
+  log "Firmware: UEFI (OVMF)"
 fi
 
 if [[ "$ATTACH_ISO" == "1" && -f "$ISO" ]]; then
