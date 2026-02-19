@@ -23,7 +23,11 @@ if [[ ! -w "$DIR/$IMG" ]]; then
 fi
 
 MEM="${MEM:-64G}"
-CPUS="${CPUS:-16}"
+CPUS="${CPUS:-20}"
+SMP_TOPOLOGY="${SMP_TOPOLOGY:-sockets=1,cores=10,threads=2}"
+# Pin VM to NUMA node 1 (where the GPU lives) for lowest latency.
+# NUMA node 1 CPUs: 10-19 (cores), 30-39 (hyperthreads).
+CPU_AFFINITY="${CPU_AFFINITY:-10-19,30-39}"
 # Default to an emulated NIC with built-in Windows drivers; switch to virtio after installing its driver.
 NIC_MODEL="${NIC_MODEL:-e1000}"
 # Audio backend for the virtual HDA device (pa, alsa, sdl, none).
@@ -284,11 +288,11 @@ fi
 args=(
   -enable-kvm
   -machine q35
-  -cpu host,kvm=off,hv_vendor_id=whatever
+  -cpu host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -m "$MEM"
-  -smp "$CPUS"
+  -smp "$CPUS,$SMP_TOPOLOGY"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
   -drive "file=$DIR/$IMG,if=ide,index=0"
   # Attach dedicated samples disk (raw block device). Use IDE for out-of-box Windows support.
@@ -343,4 +347,4 @@ if [[ ${#USB_DEVICES[@]} -gt 0 ]]; then
   done
 fi
 
-exec "$QEMU_BIN" "${args[@]}"
+exec taskset -c "$CPU_AFFINITY" "$QEMU_BIN" "${args[@]}"
