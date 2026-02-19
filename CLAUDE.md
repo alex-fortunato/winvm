@@ -111,6 +111,18 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 - Network Discovery and File Sharing enabled on Private
 - Windows Firewall allows `vvepsrv.exe` on Private (TCP + UDP), or use: `netsh advfirewall firewall add rule name="VEP Server" dir=in action=allow program="C:\...\vvepsrv.exe" enable=yes profile=private`
 
+## Mouse Sharing (Barrier)
+
+[Barrier](https://github.com/debauchee/barrier) is installed on both the Mac and the Windows VM to share one mouse and keyboard across both monitors seamlessly.
+
+- **Mac** = Barrier Server (primary machine with mouse/keyboard)
+- **Windows VM** = Barrier Client
+- The VM's dedicated K620 monitor appears as a second screen in Barrier's layout
+- SSL is disabled in Barrier Preferences on both sides (trusted LAN, avoids certificate mismatch issues)
+- Windows Firewall has an inbound rule allowing TCP port 24800 on the Private profile
+
+Note: [Input Leap](https://github.com/input-leap/input-leap) is the actively maintained successor to Barrier. Consider migrating if Barrier causes issues.
+
 ## Disk / Storage Notes
 
 - The qcow2 image is on `/dev/sdb` (same disk as Linux). Keep the host disk from filling up — the qcow2 grows on write and cannot be auto-compacted without running `qemu-img convert`.
