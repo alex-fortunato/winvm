@@ -37,7 +37,7 @@ NETWORK_MODE="${NETWORK_MODE:-auto}"
 BRIDGE_NAME="${BRIDGE_NAME:-br0}"
 TAP_IFACE="${TAP_IFACE:-tap0}"
 # Set to 1 once virtio drivers are installed in Windows to use virtio-net.
-PREFER_VIRTIO_NET="${PREFER_VIRTIO_NET:-0}"
+PREFER_VIRTIO_NET="${PREFER_VIRTIO_NET:-1}"
 # Choose how to attach USB devices: block passthrough (default) or host passthrough.
 USB_MODE="${USB_MODE:-block}"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
