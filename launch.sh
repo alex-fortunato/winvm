@@ -296,7 +296,7 @@ args=(
   # Use AHCI/IDE so Windows sees the disk without extra drivers
   -drive "file=$DIR/$IMG,if=ide,index=0"
   # Attach dedicated samples disk (raw block device). Use IDE for out-of-box Windows support.
-  -drive "file=$SAMPLES_DISK,if=ide,index=1,format=raw,cache=none,aio=native"
+  -drive "file=$SAMPLES_DISK,if=virtio,index=1,format=raw,cache=none,aio=native"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
   "${display_dev[@]}"
