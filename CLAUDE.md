@@ -79,6 +79,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `SMP_TOPOLOGY` | `sockets=1,cores=10,threads=2` | CPU topology presented to Windows |
 | `CPU_AFFINITY` | `10-19,30-39` | numactl CPU list (NUMA node 1); memory is also bound to node 1 via `--membind=1` |
 | `SAMPLES_DISK` | `/dev/sda` | Raw block device for sample libraries |
+| `Games464sdc` | `/dev/sdc` | Secondary 464GB disk (games/misc); virtio-blk passthrough, same settings as SAMPLES_DISK |
 | `USB_DEVICES` | `sdd sde` | Block devices to pass through as USB storage |
 | `USB_MODE` | `block` | `block` = USB mass storage emulation; `host` = direct USB host passthrough |
 | `PASSTHROUGH_GPU` | `84:00.0` | PCI address of K620 GPU |

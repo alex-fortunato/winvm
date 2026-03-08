@@ -12,6 +12,7 @@ ISO="${ISO:-$USER_HOME/Downloads/Win10_22H2_English_x64v1.iso}"
 ATTACH_ISO="${ATTACH_ISO:-0}"
 USB_DEVICES=(${USB_DEVICES:-sdd sde})
 SAMPLES_DISK="${SAMPLES_DISK:-/dev/sda}"
+Games464sdc="${Games464sdc:-/dev/sdc}"
 
 if [[ ! -f "$DIR/$IMG" ]]; then
   echo "Image '$IMG' not found in $DIR" >&2
@@ -284,6 +285,7 @@ else
 fi
 
 [[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
+[[ -b "$Games464sdc" ]] || die "Games disk $Games464sdc not found (set Games464sdc or attach the device)"
 
 args=(
   -enable-kvm
@@ -297,6 +299,7 @@ args=(
   -drive "file=$DIR/$IMG,if=ide,index=0"
   # Attach dedicated samples disk (raw block device). Use IDE for out-of-box Windows support.
   -drive "file=$SAMPLES_DISK,if=virtio,index=1,format=raw,cache=none,aio=native"
+  -drive "file=$Games464sdc,if=virtio,index=2,format=raw,cache=none,aio=native"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
   "${display_dev[@]}"
