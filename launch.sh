@@ -347,4 +347,4 @@ if [[ ${#USB_DEVICES[@]} -gt 0 ]]; then
   done
 fi
 
-exec taskset -c "$CPU_AFFINITY" "$QEMU_BIN" "${args[@]}"
+exec numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}"

@@ -18,14 +18,14 @@ This is a QEMU/KVM Windows 10 Pro VM that runs **Vienna Ensemble Pro (VEP) Serve
 - **RAM**: 64GB
 - **CPUs**: 20 (sockets=1, cores=10, threads=2)
 - **C: drive**: `win10pro.qcow2` — 250GB virtual, ~64GB actual on disk (qcow2 is sparse)
-- **Samples**: `/dev/sda` raw passthrough (IDE, cache=none, aio=native)
+- **Samples**: `/dev/sda` raw passthrough (virtio-blk, cache=none, aio=native)
 - **GPU**: Quadro K620 via vfio-pci passthrough
 - **NIC**: e1000 (emulated Intel GbE) on `br0`, gets a real LAN IP via DHCP
 
 ## Key Design Decisions
 
 ### CPU Pinning (NUMA)
-The entire QEMU process is launched under `taskset -c 10-19,30-39`, pinning it exclusively to NUMA node 1. This ensures the VM's CPU threads, its memory allocations, and the K620 GPU all share the same NUMA node — eliminating cross-NUMA memory latency. Critical for real-time audio.
+The entire QEMU process is launched under `numactl -C 10-19,30-39 --preferred=1`, pinning CPUs to NUMA node 1 and strongly preferring node 1 for memory allocation. `--preferred` rather than `--membind` is used because NUMA node 1 has ~63GB of physical RAM but the VM requests 64GB — strict binding would cause an OOM kill. With `--preferred`, the ~1GB overflow spills to node 0 while the rest stays local. Critical for real-time audio. (Previously used `taskset`, which only pinned CPUs but left memory allocation entirely unbound.)
 
 ### GPU Passthrough (vfio-pci)
 The K620 is passed directly to Windows via `vfio-pci`. A few important details:
@@ -51,7 +51,7 @@ The VM is connected to `br0` (bridged to `enp5s0f0`), so it gets a real LAN IP. 
 
 ### Storage
 - **C: drive**: qcow2 sparse image. Virtual size 250GB, actual host disk usage ~64GB. The gap is mainly because large Windows system files (pagefile.sys, hiberfil.sys) are mostly zeros which qcow2 doesn't store. Note: hibernation has been disabled (`powercfg /hibernate off`) to reclaim ~48GB on C:.
-- **Samples disk**: `/dev/sda` passed as a raw IDE device with `cache=none,aio=native` — bypasses host page cache for maximum sequential read throughput, important for streaming large sample libraries.
+- **Samples disk**: `/dev/sda` passed as a raw virtio-blk device with `cache=none,aio=native` — bypasses host page cache for maximum sequential read throughput, and virtio-blk allows high I/O queue depth so the SSD RAID can serve parallel reads efficiently. Important for streaming large sample libraries. Requires the `viostor` driver installed in Windows (from the virtio-win ISO, `viostor\w10\amd64\viostor.inf`).
 
 ### SMBIOS Spoofing
 The VM presents as a Dell OptiPlex 7010 with AMI BIOS. Helps with driver compatibility and software activation.
@@ -77,7 +77,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `MEM` | `64G` | VM RAM |
 | `CPUS` | `20` | vCPU count |
 | `SMP_TOPOLOGY` | `sockets=1,cores=10,threads=2` | CPU topology presented to Windows |
-| `CPU_AFFINITY` | `10-19,30-39` | taskset CPU list (NUMA node 1) |
+| `CPU_AFFINITY` | `10-19,30-39` | numactl CPU list (NUMA node 1); memory is also bound to node 1 via `--membind=1` |
 | `SAMPLES_DISK` | `/dev/sda` | Raw block device for sample libraries |
 | `USB_DEVICES` | `sdd sde` | Block devices to pass through as USB storage |
 | `USB_MODE` | `block` | `block` = USB mass storage emulation; `host` = direct USB host passthrough |
@@ -123,9 +123,18 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 
 Note: [Input Leap](https://github.com/input-leap/input-leap) is the actively maintained successor to Barrier. Consider migrating if Barrier causes issues.
 
+## Host Tuning (Real-time Audio)
+
+- **CPU governor**: NUMA node 1 cores (10–19, 30–39) should be set to `performance` to prevent frequency scaling latency spikes. This resets on reboot — set it before launching the VM:
+  ```bash
+  sudo bash -c 'for cpu in $(seq 10 19) $(seq 30 39); do echo performance > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done'
+  ```
+- **Windows power plan**: Set to **High Performance** inside the VM (Control Panel → Power Options).
+
 ## Disk / Storage Notes
 
 - The qcow2 image is on `/dev/sdb` (same disk as Linux). Keep the host disk from filling up — the qcow2 grows on write and cannot be auto-compacted without running `qemu-img convert`.
 - To check actual qcow2 size on disk: `qemu-img info -U win10pro.qcow2`
 - To resize: shut down VM, then `qemu-img resize win10pro.qcow2 <size>`, then extend the partition in Windows Disk Management.
 - **Always make a backup before resizing or doing partition surgery.**
+- Backup files `win10pro.qcow2.bak` and `OVMF_VARS.4m.fd.bak` exist from before the virtio migration. Safe to delete once the VM is confirmed stable.
