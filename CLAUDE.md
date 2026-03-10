@@ -2,7 +2,9 @@
 
 ## Purpose
 
-This is a QEMU/KVM Windows 10 Pro VM that runs **Vienna Ensemble Pro (VEP) Server** as a dedicated sample playback slave. A Mac running Cubase connects to it over the LAN and offloads all sample library processing (Kontakt, etc.) onto this machine. The VM needs real-time audio performance and low latency.
+This is a QEMU/KVM Windows 10 Pro VM with two purposes:
+1. **Primary**: Runs **Vienna Ensemble Pro (VEP) Server** as a dedicated sample playback slave. A Mac running Cubase connects over the LAN and offloads all sample library processing (Kontakt, etc.). Needs real-time audio performance and low latency.
+2. **Secondary**: Gaming (Steam). Launch with `GAMING_MODE=1` to hide the hypervisor from anti-cheat.
 
 ## Host Hardware
 
@@ -19,8 +21,9 @@ This is a QEMU/KVM Windows 10 Pro VM that runs **Vienna Ensemble Pro (VEP) Serve
 - **CPUs**: 20 (sockets=1, cores=10, threads=2)
 - **C: drive**: `win10pro.qcow2` — 250GB virtual, ~64GB actual on disk (qcow2 is sparse)
 - **Samples**: `/dev/sda` raw passthrough (virtio-blk, cache=none, aio=native)
+- **Games/misc disk**: `/dev/sdc` (464.7GB) raw passthrough, same settings as samples disk
 - **GPU**: Quadro K620 via vfio-pci passthrough
-- **NIC**: e1000 (emulated Intel GbE) on `br0`, gets a real LAN IP via DHCP
+- **NIC**: virtio-net on `br0`, gets a real LAN IP via DHCP; MAC spoofed to Dell OUI (`F8:B4:6A:...`)
 
 ## Key Design Decisions
 
@@ -53,8 +56,8 @@ The VM is connected to `br0` (bridged to `enp5s0f0`), so it gets a real LAN IP. 
 - **C: drive**: qcow2 sparse image. Virtual size 250GB, actual host disk usage ~64GB. The gap is mainly because large Windows system files (pagefile.sys, hiberfil.sys) are mostly zeros which qcow2 doesn't store. Note: hibernation has been disabled (`powercfg /hibernate off`) to reclaim ~48GB on C:.
 - **Samples disk**: `/dev/sda` passed as a raw virtio-blk device with `cache=none,aio=native` — bypasses host page cache for maximum sequential read throughput, and virtio-blk allows high I/O queue depth so the SSD RAID can serve parallel reads efficiently. Important for streaming large sample libraries. Requires the `viostor` driver installed in Windows (from the virtio-win ISO, `viostor\w10\amd64\viostor.inf`).
 
-### SMBIOS Spoofing
-The VM presents as a Dell OptiPlex 7010 with AMI BIOS. Helps with driver compatibility and software activation.
+### SMBIOS Spoofing & NIC MAC
+The VM presents as a Dell OptiPlex 7010 with AMI BIOS across all SMBIOS types (0=BIOS, 1=system, 2=baseboard, 3=chassis). The NIC MAC address uses a real Dell OUI (`F8:B4:6A:3C:A1:7E`). Together these reduce VM fingerprinting from anti-cheat and driver compatibility checks.
 
 ## Files
 
@@ -96,6 +99,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `ISO` | `~/Downloads/Win10_22H2_English_x64v1.iso` | Path to installer ISO |
 | `QEMU_BIN` | `qemu-system-x86_64` | QEMU binary to use |
 | `SHOW_NET_SETUP` | `0` | Set to `1` to print bridge/tap setup instructions and exit |
+| `GAMING_MODE` | `0` | Set to `1` to strip Hyper-V enlightenments and clear the hypervisor CPUID bit — hides the VM from anti-cheat (EAC). Slight latency tradeoff; don't use for VEP sessions. |
 
 ## VEP Workflow
 
@@ -131,6 +135,14 @@ Note: [Input Leap](https://github.com/input-leap/input-leap) is the actively mai
   sudo bash -c 'for cpu in $(seq 10 19) $(seq 30 39); do echo performance > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done'
   ```
 - **Windows power plan**: Set to **High Performance** inside the VM (Control Panel → Power Options).
+
+## Gaming
+
+Launch with `sudo GAMING_MODE=1 ./launch.sh`. This strips the `hv_*` Hyper-V enlightenment flags and clears the CPUID hypervisor present bit (`-hypervisor`), making Windows report no hypervisor in System Information — which is what EAC checks.
+
+**GPU limitation**: The Quadro K620 only supports DirectX 12 at feature level 11_0 and is below the minimum spec for many modern games (e.g. Marvel Rivals requires GTX 1060 / DX12 FL 12_0+). A Pascal-generation GPU or newer is needed for those titles.
+
+**What GAMING_MODE does NOT fix**: ACPI tables still contain `BOCHS` OEM strings, which aggressive anti-cheat may detect. If a game still blocks after GAMING_MODE, ACPI table spoofing is the next step (requires a patched QEMU build — search AUR for `qemu-patched` or similar).
 
 ## Disk / Storage Notes
 

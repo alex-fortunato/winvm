@@ -42,6 +42,9 @@ PREFER_VIRTIO_NET="${PREFER_VIRTIO_NET:-1}"
 # Choose how to attach USB devices: block passthrough (default) or host passthrough.
 USB_MODE="${USB_MODE:-block}"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+# Set to 1 to strip Hyper-V enlightenments, hiding the hypervisor from Windows.
+# Helps with anti-cheat (EAC) at the cost of some real-time audio latency. Use for gaming, not VEP.
+GAMING_MODE="${GAMING_MODE:-0}"
 
 # UEFI firmware (OVMF) – required for GPU passthrough
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
@@ -287,12 +290,21 @@ fi
 [[ -b "$SAMPLES_DISK" ]] || die "Samples disk $SAMPLES_DISK not found (set SAMPLES_DISK or attach the device)"
 [[ -b "$Games464sdc" ]] || die "Games disk $Games464sdc not found (set Games464sdc or attach the device)"
 
+if [[ "$GAMING_MODE" == "1" ]]; then
+  cpu_flags="host,kvm=off,-hypervisor"
+  log "Gaming mode: Hyper-V enlightenments disabled (hypervisor hidden from Windows)"
+else
+  cpu_flags="host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer"
+fi
+
 args=(
   -enable-kvm
   -machine q35
-  -cpu host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer
+  -cpu "$cpu_flags"
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
+  -smbios "type=2,manufacturer=Dell Inc.,product=0NC7TW,version=A01"
+  -smbios "type=3,manufacturer=Dell Inc."
   -m "$MEM"
   -smp "$CPUS,$SMP_TOPOLOGY"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
@@ -310,7 +322,7 @@ args=(
   -device ich9-intel-hda
   -device hda-duplex,audiodev="$audio_dev_id"
   "${netdev_arg[@]}"
-  -device "${NIC_DEVICE},netdev=net0"
+  -device "${NIC_DEVICE},netdev=net0,mac=F8:B4:6A:3C:A1:7E"
 )
 
 if [[ "$FIRMWARE" == "uefi" ]]; then
