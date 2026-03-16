@@ -45,6 +45,9 @@ QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 # Set to 1 to strip Hyper-V enlightenments, hiding the hypervisor from Windows.
 # Helps with anti-cheat (EAC) at the cost of some real-time audio latency. Use for gaming, not VEP.
 GAMING_MODE="${GAMING_MODE:-0}"
+# Set to 1 to disable the QXL virtual display (no GTK management window on the host).
+# The passthrough GPU display still works; this just removes the secondary host-side window.
+NO_QXL="${NO_QXL:-0}"
 
 # UEFI firmware (OVMF) – required for GPU passthrough
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
@@ -262,10 +265,16 @@ if [[ -n "$PASSTHROUGH_GPU" && "$PASSTHROUGH_GPU" != "none" ]]; then
   if [[ -n "$PASSTHROUGH_GPU_AUDIO" && "$PASSTHROUGH_GPU_AUDIO" != "none" ]]; then
     gpu_dev+=(-device "vfio-pci,host=$PASSTHROUGH_GPU_AUDIO")
   fi
-  # Use QXL for a management window on the host
-  display_dev=(-display "gtk")
-  gpu_dev+=(-vga "qxl")
-  log "GPU passthrough: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+, audio=$PASSTHROUGH_GPU_AUDIO} (+ QXL for host display)"
+  if [[ "$NO_QXL" == "1" ]]; then
+    # Headless on the host side; Windows uses the passthrough GPU exclusively
+    display_dev=(-display "none" -vga "none")
+    log "GPU passthrough: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+, audio=$PASSTHROUGH_GPU_AUDIO} (headless, QXL disabled)"
+  else
+    # Use QXL for a management window on the host
+    display_dev=(-display "gtk")
+    gpu_dev+=(-vga "qxl")
+    log "GPU passthrough: ${PASSTHROUGH_GPU}${PASSTHROUGH_GPU_AUDIO:+, audio=$PASSTHROUGH_GPU_AUDIO} (+ QXL for host display)"
+  fi
 else
   case "$GPU_MODEL" in
     virtio-gl)

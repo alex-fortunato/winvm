@@ -100,6 +100,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `QEMU_BIN` | `qemu-system-x86_64` | QEMU binary to use |
 | `SHOW_NET_SETUP` | `0` | Set to `1` to print bridge/tap setup instructions and exit |
 | `GAMING_MODE` | `0` | Set to `1` to strip Hyper-V enlightenments and clear the hypervisor CPUID bit — hides the VM from anti-cheat (EAC). Slight latency tradeoff; don't use for VEP sessions. |
+| `NO_QXL` | `0` | Set to `1` to disable the QXL virtual display and GTK management window. The passthrough GPU display still works. |
 
 ## VEP Workflow
 
