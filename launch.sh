@@ -23,6 +23,13 @@ if [[ ! -w "$DIR/$IMG" ]]; then
   exit 1
 fi
 
+# VEP_MODE=1 applies sample-server-optimised defaults; any explicitly set variable overrides them.
+VEP_MODE="${VEP_MODE:-0}"
+if [[ "$VEP_MODE" == "1" ]]; then
+  : "${NO_QXL:=1}"
+  : "${AUDIO_BACKEND:=none}"
+fi
+
 MEM="${MEM:-64G}"
 CPUS="${CPUS:-20}"
 SMP_TOPOLOGY="${SMP_TOPOLOGY:-sockets=1,cores=10,threads=2}"
@@ -48,6 +55,10 @@ GAMING_MODE="${GAMING_MODE:-0}"
 # Set to 1 to disable the QXL virtual display (no GTK management window on the host).
 # The passthrough GPU display still works; this just removes the secondary host-side window.
 NO_QXL="${NO_QXL:-0}"
+# Back VM RAM with huge pages to reduce EPT TLB pressure (improves memory access latency at high RAM usage).
+# Set to 2m (2MB pages, runtime-allocatable) or 1g (1GB pages, requires kernel boot param).
+# Requires host pages to be pre-allocated — see CLAUDE.md for setup.
+HUGEPAGES="${HUGEPAGES:-0}"
 
 # UEFI firmware (OVMF) – required for GPU passthrough
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
@@ -246,10 +257,14 @@ case "$AUDIO_BACKEND" in
   pa) audio_dev=(-audiodev "pa,id=$audio_dev_id") ;;
   alsa) audio_dev=(-audiodev "alsa,id=$audio_dev_id") ;;
   sdl) audio_dev=(-audiodev "sdl,id=$audio_dev_id") ;;
-  none) audio_dev=(-audiodev "none,id=$audio_dev_id") ;;
+  none) audio_dev=() ;;
   *) die "Unknown AUDIO_BACKEND '$AUDIO_BACKEND' (use pa|alsa|sdl|none)" ;;
 esac
-log "Audio backend: ${AUDIO_BACKEND} (device=ich9-intel-hda)"
+if [[ "$AUDIO_BACKEND" == "none" ]]; then
+  log "Audio backend: none (HDA device omitted)"
+else
+  log "Audio backend: ${AUDIO_BACKEND} (device=ich9-intel-hda)"
+fi
 
 # GPU Passthrough settings
 PASSTHROUGH_GPU="${PASSTHROUGH_GPU:-84:00.0}"
@@ -306,15 +321,54 @@ else
   cpu_flags="host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer"
 fi
 
+[[ "$VEP_MODE" == "1" ]] && log "VEP mode: audio=$AUDIO_BACKEND no_qxl=$NO_QXL"
+
+audio_hda_dev=()
+if [[ "$AUDIO_BACKEND" != "none" ]]; then
+  audio_hda_dev=(-device ich9-intel-hda -device "hda-duplex,audiodev=$audio_dev_id")
+fi
+
+machine_arg="q35"
+mem_args=(-m "$MEM")
+
+if [[ "$HUGEPAGES" != "0" ]]; then
+  case "$HUGEPAGES" in
+    2m) hp_path="/dev/hugepages"
+        hp_sysfs="/sys/kernel/mm/hugepages/hugepages-2048kB"
+        hp_label="2MB" ;;
+    1g) hp_path="/dev/hugepages1G"
+        hp_sysfs="/sys/kernel/mm/hugepages/hugepages-1048576kB"
+        hp_label="1GB" ;;
+    *)  die "Unknown HUGEPAGES value '$HUGEPAGES' (use 2m or 1g)" ;;
+  esac
+
+  # Parse MEM (e.g. 64G) and calculate how many pages are needed
+  case "${MEM^^}" in
+    *G) mem_mb=$(( ${MEM%[Gg]} * 1024 )) ;;
+    *M) mem_mb=${MEM%[Mm]} ;;
+    *)  die "Cannot parse MEM='$MEM' for huge pages calculation" ;;
+  esac
+  [[ "$HUGEPAGES" == "2m" ]] && hp_needed=$(( mem_mb / 2 )) || hp_needed=$(( (mem_mb + 1023) / 1024 ))
+
+  [[ -f "$hp_sysfs/free_hugepages" ]] || die "${hp_label} huge pages not available on this kernel — check CLAUDE.md for setup"
+  hp_free=$(< "$hp_sysfs/free_hugepages")
+  [[ "$hp_free" -ge "$hp_needed" ]] \
+    || die "Not enough ${hp_label} huge pages: need $hp_needed, only $hp_free free. See CLAUDE.md for setup."
+
+  machine_arg="q35,memory-backend=ram"
+  mem_args=(-object "memory-backend-file,id=ram,size=${MEM},mem-path=${hp_path},prealloc=on,share=on")
+  log "Huge pages: ${hp_label} (need=${hp_needed}, free=${hp_free}, path=${hp_path})"
+fi
+
 args=(
   -enable-kvm
-  -machine q35
+  -machine "$machine_arg"
   -cpu "$cpu_flags"
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -smbios "type=2,manufacturer=Dell Inc.,product=0NC7TW,version=A01"
   -smbios "type=3,manufacturer=Dell Inc."
-  -m "$MEM"
+  "${mem_args[@]}"
   -smp "$CPUS,$SMP_TOPOLOGY"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
   -drive "file=$DIR/$IMG,if=ide,index=0"
@@ -328,8 +382,7 @@ args=(
   -device virtio-tablet
   -device virtio-keyboard
   "${audio_dev[@]}"
-  -device ich9-intel-hda
-  -device hda-duplex,audiodev="$audio_dev_id"
+  "${audio_hda_dev[@]}"
   "${netdev_arg[@]}"
   -device "${NIC_DEVICE},netdev=net0,mac=F8:B4:6A:3C:A1:7E"
 )

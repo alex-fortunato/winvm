@@ -36,7 +36,7 @@ The K620 is passed directly to Windows via `vfio-pci`. A few important details:
 - `romfile=k620.rom` supplies a dumped copy of the card's VBIOS — required for stable passthrough on some cards
 - `kvm=off` suppresses the KVM CPUID flag — NVIDIA drivers refuse to load if they detect they're in a VM
 - `hv_vendor_id=whatever` randomizes the Hyper-V vendor string — another NVIDIA anti-detection workaround
-- A secondary **QXL virtual GPU** is always added alongside the passthrough GPU, giving a management window on the Linux host via GTK
+- A secondary **QXL virtual GPU** is added alongside the passthrough GPU by default, giving a management window on the Linux host via GTK — disable with `NO_QXL=1` (also the default in `VEP_MODE=1`)
 
 UEFI (OVMF) is required for GPU passthrough — the GPU needs UEFI GOP to initialize.
 
@@ -80,7 +80,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `MEM` | `64G` | VM RAM |
 | `CPUS` | `20` | vCPU count |
 | `SMP_TOPOLOGY` | `sockets=1,cores=10,threads=2` | CPU topology presented to Windows |
-| `CPU_AFFINITY` | `10-19,30-39` | numactl CPU list (NUMA node 1); memory is also bound to node 1 via `--membind=1` |
+| `CPU_AFFINITY` | `10-19,30-39` | numactl CPU list (NUMA node 1); memory strongly preferred on node 1 via `--preferred=1` (not `--membind` — see CPU Pinning note) |
 | `SAMPLES_DISK` | `/dev/sda` | Raw block device for sample libraries |
 | `Games464sdc` | `/dev/sdc` | Secondary 464GB disk (games/misc); virtio-blk passthrough, same settings as SAMPLES_DISK |
 | `USB_DEVICES` | `sdd sde` | Block devices to pass through as USB storage |
@@ -93,18 +93,20 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | `BRIDGE_NAME` | `br0` | Host bridge interface |
 | `TAP_IFACE` | `tap0` | Tap interface for tap mode |
 | `NIC_MODEL` | `e1000` | NIC model for Windows (`e1000` works out of box) |
-| `PREFER_VIRTIO_NET` | `0` | Set to `1` once virtio drivers are installed in Windows |
-| `AUDIO_BACKEND` | `pa` | PulseAudio (`pa`), ALSA, SDL, or `none` |
+| `PREFER_VIRTIO_NET` | `1` | Uses virtio-net by default; set to `0` if the virtio NIC driver isn't installed in Windows |
+| `AUDIO_BACKEND` | `pa` | PulseAudio (`pa`), ALSA, SDL, or `none`. When `none`, the HDA device is omitted entirely — no virtual audio device in Windows |
 | `ATTACH_ISO` | `0` | Set to `1` to attach the Windows installer ISO |
 | `ISO` | `~/Downloads/Win10_22H2_English_x64v1.iso` | Path to installer ISO |
 | `QEMU_BIN` | `qemu-system-x86_64` | QEMU binary to use |
 | `SHOW_NET_SETUP` | `0` | Set to `1` to print bridge/tap setup instructions and exit |
 | `GAMING_MODE` | `0` | Set to `1` to strip Hyper-V enlightenments and clear the hypervisor CPUID bit — hides the VM from anti-cheat (EAC). Slight latency tradeoff; don't use for VEP sessions. |
 | `NO_QXL` | `0` | Set to `1` to disable the QXL virtual display and GTK management window. The passthrough GPU display still works. |
+| `VEP_MODE` | `0` | Set to `1` for sample-server mode: disables QXL and omits the HDA audio device. CPU topology is unchanged (still 20 vCPUs with SMT). All individual variables can still be overridden. Example: `VEP_MODE=1 NO_QXL=0 ./launch.sh` re-enables QXL. |
+| `HUGEPAGES` | `0` | Set to `2m` or `1g` to back VM RAM with huge pages, reducing EPT TLB pressure at high memory usage. Requires host-side setup — see Huge Pages section below. |
 
 ## VEP Workflow
 
-1. Launch the VM with `./launch.sh` (requires root or appropriate permissions for vfio/bridge)
+1. Launch the VM with `sudo VEP_MODE=1 ./launch.sh` for optimised sample-server defaults (no QXL window, no HDA device, full 20 vCPUs). Add `HUGEPAGES=2m` if huge pages are configured on the host. Or use plain `./launch.sh` if you want the management window / audio device.
 2. Windows boots; start VEP Server (64-bit) with "Advertise on local network" enabled
 3. On the Mac, open Cubase and the VEP plugin — it discovers the server by LAN broadcast
 4. Cubase routes instrument tracks to VEP Server; VEP streams audio back
@@ -128,6 +130,50 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 - Windows Firewall has an inbound rule allowing TCP port 24800 on the Private profile
 
 Note: [Input Leap](https://github.com/input-leap/input-leap) is the actively maintained successor to Barrier. Consider migrating if Barrier causes issues.
+
+## Huge Pages
+
+Backing VM RAM with huge pages reduces EPT (Extended Page Table) TLB pressure. With 4KB pages and 64GB of RAM, the hypervisor must manage millions of page table entries; frequent TLB misses add latency to every guest memory access. Huge pages collapse this dramatically.
+
+The launch script validates that enough free pages exist before starting QEMU and exits with a clear error if they don't — no silent fallback.
+
+**2MB pages — recommended, allocatable at runtime:**
+
+Option A — persist across reboots via sysctl (recommended):
+```bash
+# Create a sysctl drop-in (applied automatically at every boot):
+echo 'vm.nr_hugepages = 33000' | sudo tee /etc/sysctl.d/10-hugepages.conf
+# Apply immediately without rebooting:
+sudo sysctl -p /etc/sysctl.d/10-hugepages.conf
+# Verify (free_hugepages should be ≥ 32768):
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages
+```
+
+Option B — one-time allocation (resets on reboot):
+```bash
+sudo bash -c 'echo 33000 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages  # should be ≥ 32768
+```
+
+Then launch with `HUGEPAGES=2m ./launch.sh`. hugetlbfs is mounted at `/dev/hugepages` by systemd automatically on Arch.
+
+**1GB pages** (better EPT reduction, but requires a kernel boot parameter — try 2MB first):
+```bash
+# Add to GRUB_CMDLINE_LINUX in /etc/default/grub:
+#   hugepagesz=1G hugepages=65
+# Then:
+sudo grub-mkconfig -o /boot/grub/grub.cfg && reboot
+# After reboot, mount the 1G hugetlbfs and make it persistent:
+sudo mkdir -p /dev/hugepages1G
+sudo mount -t hugetlbfs -o pagesize=1G nodev /dev/hugepages1G
+echo 'nodev /dev/hugepages1G hugetlbfs pagesize=1G 0 0' | sudo tee -a /etc/fstab
+```
+Then launch with `HUGEPAGES=1g ./launch.sh`.
+
+**Notes:**
+- The script uses the modern QEMU `memory-backend-file` object, which correctly maps the pre-allocated pages to the VM rather than allocating new memory on top of them.
+- The full 64GB is locked immediately at VM start — the host needs enough free huge pages or the launch aborts before QEMU even starts.
+- To release pages (Option B only): `sudo bash -c 'echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'`
 
 ## Host Tuning (Real-time Audio)
 
