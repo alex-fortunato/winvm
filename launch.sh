@@ -30,7 +30,7 @@ if [[ "$VEP_MODE" == "1" ]]; then
   : "${AUDIO_BACKEND:=none}"
 fi
 
-MEM="${MEM:-64G}"
+MEM="${MEM:-96G}"
 CPUS="${CPUS:-20}"
 SMP_TOPOLOGY="${SMP_TOPOLOGY:-sockets=1,cores=10,threads=2}"
 # Pin VM to NUMA node 1 (where the GPU lives) for lowest latency.
@@ -52,6 +52,10 @@ QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 # Set to 1 to strip Hyper-V enlightenments, hiding the hypervisor from Windows.
 # Helps with anti-cheat (EAC) at the cost of some real-time audio latency. Use for gaming, not VEP.
 GAMING_MODE="${GAMING_MODE:-0}"
+# Pin each vCPU thread to a specific physical CPU after launch, and raise to SCHED_FIFO priority.
+# Eliminates cache thrashing from vCPU threads floating across cores; reduces scheduling jitter.
+# Requires root (for chrt). Set to 0 to disable.
+PIN_VCPUS="${PIN_VCPUS:-1}"
 # Set to 1 to disable the QXL virtual display (no GTK management window on the host).
 # The passthrough GPU display still works; this just removes the secondary host-side window.
 NO_QXL="${NO_QXL:-0}"
@@ -70,6 +74,72 @@ FIRMWARE="${FIRMWARE:-uefi}"
 log() { echo "[winvm] $*"; }
 warn() { echo "[winvm][warn] $*" >&2; }
 die() { echo "[winvm][error] $*" >&2; exit 1; }
+
+# vCPU → physical CPU pinning table for sockets=1,cores=10,threads=2 on NUMA node 1.
+# Physical core K occupies logical CPUs 10+K (HT0) and 30+K (HT1).
+# vCPU 2K = core K HT0, vCPU 2K+1 = core K HT1 — map them to real SMT sibling pairs
+# so Windows' view of SMT topology matches actual hardware cache sharing.
+VCPU_TO_PHYS=(10 30 11 31 12 32 13 33 14 34 15 35 16 36 17 37 18 38 19 39)
+
+pin_vcpus() {
+  local sock="$1" pinned=0 vcpu_id tid phys_cpu
+  local cpu_map
+  # Ask QEMU for the authoritative vCPU-index → thread-id mapping via QMP.
+  # This works regardless of how QEMU names its threads (on Arch/QEMU 8+ they
+  # are all named "qemu-system-x86" and cannot be identified by comm alone).
+  cpu_map=$(QMP_SOCK="$sock" python3 - 2>/dev/null <<'PYEOF'
+import socket as _sock, json, time, os
+
+path = os.environ['QMP_SOCK']
+s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+s.settimeout(5)
+for _ in range(10):
+    try:
+        s.connect(path)
+        break
+    except OSError:
+        time.sleep(0.5)
+else:
+    raise SystemExit(1)
+
+f = s.makefile('r')
+
+def next_response():
+    while True:
+        line = f.readline()
+        if not line:
+            raise SystemExit(1)
+        try:
+            obj = json.loads(line)
+            if any(k in obj for k in ('QMP', 'return', 'error')):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+next_response()                                     # greeting
+s.sendall(b'{"execute":"qmp_capabilities"}\n')
+next_response()                                     # ack
+s.sendall(b'{"execute":"query-cpus-fast"}\n')
+result = next_response()
+for cpu in result.get('return', []):
+    print(cpu['cpu-index'], cpu['thread-id'])
+PYEOF
+) || { echo 0; return; }
+
+  while IFS=' ' read -r vcpu_id tid; do
+    [[ -n "$vcpu_id" && -n "$tid" ]] || continue
+    if [[ "$vcpu_id" -lt "${#VCPU_TO_PHYS[@]}" ]]; then
+      phys_cpu="${VCPU_TO_PHYS[$vcpu_id]}"
+      if taskset -cp "$phys_cpu" "$tid" >/dev/null 2>&1; then
+        pinned=$(( pinned + 1 ))
+        # Best-effort: SCHED_FIFO may be blocked by systemd cgroup v2 RT bandwidth limits.
+        chrt -f 1 -p "$tid" >/dev/null 2>&1 || true
+      fi
+    fi
+  done <<< "$cpu_map"
+
+  echo "$pinned"
+}
 
 if [[ "$FIRMWARE" == "uefi" ]]; then
   [[ -f "$OVMF_CODE" ]] || die "OVMF_CODE not found at $OVMF_CODE (install edk2-ovmf)"
@@ -318,7 +388,14 @@ if [[ "$GAMING_MODE" == "1" ]]; then
   cpu_flags="host,kvm=off,-hypervisor"
   log "Gaming mode: Hyper-V enlightenments disabled (hypervisor hidden from Windows)"
 else
-  cpu_flags="host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer"
+  # Core enlightenments (already present):
+  #   hv_relaxed, hv_spinlocks, hv_vapic, hv_time, hv_reset, hv_vpindex, hv_synic, hv_stimer
+  # Added enlightenments:
+  #   hv_ipi        — paravirtualized IPIs; critical for VEP's inter-plugin thread signaling
+  #   hv_tlbflush   — batched TLB shootdowns; reduces overhead of shared-memory coordination
+  #   hv_runtime    — exposes actual vCPU runtime to Windows scheduler for better decisions
+  #   hv_frequencies — accurate TSC/APIC frequencies for stable high-res timers
+  cpu_flags="host,kvm=off,hv_vendor_id=whatever,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_synic,hv_stimer,hv_ipi,hv_tlbflush,hv_runtime,hv_frequencies"
 fi
 
 [[ "$VEP_MODE" == "1" ]] && log "VEP mode: audio=$AUDIO_BACKEND no_qxl=$NO_QXL"
@@ -368,14 +445,14 @@ args=(
   -global ICH9-LPC.disable_s3=1
   -global ICH9-LPC.disable_s4=1
   -cpu "$cpu_flags"
+  # Tie RTC to host real-time clock; avoids guest clock drift during sustained load.
+  -rtc base=utc,clock=host
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
   -smbios "type=2,manufacturer=Dell Inc.,product=0NC7TW,version=A01"
   -smbios "type=3,manufacturer=Dell Inc."
   "${mem_args[@]}"
   -smp "$CPUS,$SMP_TOPOLOGY"
-  # Use AHCI/IDE so Windows sees the disk without extra drivers
-  -drive "file=$DIR/$IMG,if=ide,index=0"
   # Data disks via virtio-scsi: rotation_rate=1 tells Windows these are non-rotating (SSD),
   # enabling SSD scheduling and higher I/O queue depth. Dedicated iothread keeps disk I/O
   # off the main QEMU thread. io_uring gives lower per-operation overhead than aio=native.
@@ -386,6 +463,8 @@ args=(
   -device "scsi-hd,bus=scsi0.0,scsi-id=0,drive=drive-sda,rotation_rate=1"
   -drive "file=$Games464sdc,if=none,id=drive-sdc,format=raw,cache=none,aio=io_uring,discard=unmap"
   -device "scsi-hd,bus=scsi0.0,scsi-id=1,drive=drive-sdc,rotation_rate=1"
+  -drive "file=$DIR/$IMG,if=none,id=drive-img,format=qcow2,cache=writeback,aio=io_uring,discard=unmap"
+  -device "scsi-hd,bus=scsi0.0,scsi-id=2,drive=drive-img,rotation_rate=1"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
   "${display_dev[@]}"
@@ -435,4 +514,36 @@ if [[ ${#USB_DEVICES[@]} -gt 0 ]]; then
   done
 fi
 
-exec numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}"
+if [[ "$PIN_VCPUS" == "1" ]]; then
+  # Add a QMP socket so we can query vCPU thread IDs after launch.
+  # QEMU 8+ on Arch names all threads "qemu-system-x86"; QMP is the only reliable way
+  # to get the vcpu-index → thread-id mapping.
+  QMP_SOCK="/tmp/qemu-vcpu-$$.qmp"
+  args+=(-qmp "unix:${QMP_SOCK},server,nowait")
+
+  numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}" &
+  QEMU_PID=$!
+  # Forward SIGTERM/SIGHUP to QEMU (SIGINT propagates via shared process group).
+  trap 'kill -TERM "$QEMU_PID" 2>/dev/null || true' TERM HUP
+
+  # Wait for the QMP socket to appear, then pin vCPU threads.
+  log "vCPU pinning: waiting for QMP socket (PID=$QEMU_PID)..."
+  pinned=0
+  for attempt in {1..20}; do
+    sleep 0.5
+    [[ -d "/proc/$QEMU_PID" ]] || break   # QEMU exited early
+    [[ -S "$QMP_SOCK" ]] || continue      # socket not ready yet
+    pinned=$(pin_vcpus "$QMP_SOCK")
+    [[ "$pinned" -ge "$CPUS" ]] && break
+  done
+  if [[ "$pinned" -gt 0 ]]; then
+    log "vCPU pinning: $pinned/$CPUS threads pinned to physical CPUs with SCHED_FIFO priority"
+  else
+    warn "vCPU pinning: failed — VM still runs but vCPU threads are unpinned"
+  fi
+
+  wait "$QEMU_PID" || true
+  rm -f "$QMP_SOCK" 2>/dev/null || true
+else
+  exec numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}"
+fi
