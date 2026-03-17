@@ -56,6 +56,9 @@ The VM is connected to `br0` (bridged to `enp5s0f0`), so it gets a real LAN IP. 
 - **C: drive**: qcow2 sparse image. Virtual size 250GB, actual host disk usage ~64GB. The gap is mainly because large Windows system files (pagefile.sys, hiberfil.sys) are mostly zeros which qcow2 doesn't store. Note: hibernation has been disabled (`powercfg /hibernate off`) to reclaim ~48GB on C:.
 - **Samples disk**: `/dev/sda` passed as a raw virtio-blk device with `cache=none,aio=native` — bypasses host page cache for maximum sequential read throughput, and virtio-blk allows high I/O queue depth so the SSD RAID can serve parallel reads efficiently. Important for streaming large sample libraries. Requires the `viostor` driver installed in Windows (from the virtio-win ISO, `viostor\w10\amd64\viostor.inf`).
 
+### SMI Mitigation
+QEMU's emulated ICH9 chipset generates System Management Interrupts (SMIs) for ACPI power management events including S3 (sleep) and S4 (hibernate) state transitions. SMIs are invisible to Windows — the CPU silently stalls in System Management Mode and resumes, which Windows sees as unexplained time gaps. These show up in tools like WhySoSlow as "SM BIOS interrupt or other stall" and can cause audio glitches and application unresponsiveness. Since the VM should never sleep or hibernate, both states are disabled via `-global ICH9-LPC.disable_s3=1` and `-global ICH9-LPC.disable_s4=1`, eliminating those SMI sources.
+
 ### SMBIOS Spoofing & NIC MAC
 The VM presents as a Dell OptiPlex 7010 with AMI BIOS across all SMBIOS types (0=BIOS, 1=system, 2=baseboard, 3=chassis). The NIC MAC address uses a real Dell OUI (`F8:B4:6A:3C:A1:7E`). Together these reduce VM fingerprinting from anti-cheat and driver compatibility checks.
 

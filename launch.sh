@@ -363,6 +363,10 @@ fi
 args=(
   -enable-kvm
   -machine "$machine_arg"
+  # Disable S3 (sleep) and S4 (hibernate) ACPI states — eliminates the main SMI sources from
+  # the emulated ICH9 chipset. Hibernate is already disabled in Windows; the VM should never sleep.
+  -global ICH9-LPC.disable_s3=1
+  -global ICH9-LPC.disable_s4=1
   -cpu "$cpu_flags"
   -smbios "type=0,vendor=American Megatrends Inc.,version=1.0"
   -smbios "type=1,manufacturer=Dell Inc.,product=OptiPlex 7010,version=1.0"
