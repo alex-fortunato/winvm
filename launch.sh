@@ -376,9 +376,16 @@ args=(
   -smp "$CPUS,$SMP_TOPOLOGY"
   # Use AHCI/IDE so Windows sees the disk without extra drivers
   -drive "file=$DIR/$IMG,if=ide,index=0"
-  # Attach dedicated samples disk (raw block device). Use IDE for out-of-box Windows support.
-  -drive "file=$SAMPLES_DISK,if=virtio,index=1,format=raw,cache=none,aio=native"
-  -drive "file=$Games464sdc,if=virtio,index=2,format=raw,cache=none,aio=native"
+  # Data disks via virtio-scsi: rotation_rate=1 tells Windows these are non-rotating (SSD),
+  # enabling SSD scheduling and higher I/O queue depth. Dedicated iothread keeps disk I/O
+  # off the main QEMU thread. io_uring gives lower per-operation overhead than aio=native.
+  # Requires vioscsi driver in Windows (from virtio-win ISO: vioscsi\w10\amd64\vioscsi.inf).
+  -object iothread,id=iothread-scsi
+  -device "virtio-scsi-pci,id=scsi0,iothread=iothread-scsi,num_queues=8"
+  -drive "file=$SAMPLES_DISK,if=none,id=drive-sda,format=raw,cache=none,aio=io_uring,discard=unmap"
+  -device "scsi-hd,bus=scsi0.0,scsi-id=0,drive=drive-sda,rotation_rate=1"
+  -drive "file=$Games464sdc,if=none,id=drive-sdc,format=raw,cache=none,aio=io_uring,discard=unmap"
+  -device "scsi-hd,bus=scsi0.0,scsi-id=1,drive=drive-sdc,rotation_rate=1"
   # Prefer booting from the installed disk; menu stays available if you need to pick the CD later.
   -boot menu=on,order=c
   "${display_dev[@]}"
