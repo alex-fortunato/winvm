@@ -33,9 +33,9 @@ fi
 MEM="${MEM:-96G}"
 CPUS="${CPUS:-20}"
 SMP_TOPOLOGY="${SMP_TOPOLOGY:-sockets=1,cores=10,threads=2}"
-# Pin VM to NUMA node 1 (where the GPU lives) for lowest latency.
-# NUMA node 1 CPUs: 10-19 (cores), 30-39 (hyperthreads).
-CPU_AFFINITY="${CPU_AFFINITY:-10-19,30-39}"
+# Span both NUMA nodes to maximise memory bandwidth. GPU lives on node 1.
+# Node 0: CPUs 0-9 (cores), 20-29 (HTs). Node 1: CPUs 10-19 (cores), 30-39 (HTs).
+CPU_AFFINITY="${CPU_AFFINITY:-0-39}"
 # Default to an emulated NIC with built-in Windows drivers; switch to virtio after installing its driver.
 NIC_MODEL="${NIC_MODEL:-e1000}"
 # Audio backend for the virtual HDA device (pa, alsa, sdl, none).
@@ -63,6 +63,9 @@ NO_QXL="${NO_QXL:-0}"
 # Set to 2m (2MB pages, runtime-allocatable) or 1g (1GB pages, requires kernel boot param).
 # Requires host pages to be pre-allocated — see CLAUDE.md for setup.
 HUGEPAGES="${HUGEPAGES:-0}"
+# Expose a 2-node NUMA topology inside the guest, matching the interleaved dual-socket physical layout.
+# Gives Windows NUMA-aware thread scheduling; pairs with the dual-node CPU_AFFINITY default.
+GUEST_NUMA="${GUEST_NUMA:-1}"
 
 # UEFI firmware (OVMF) – required for GPU passthrough
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
@@ -75,11 +78,11 @@ log() { echo "[winvm] $*"; }
 warn() { echo "[winvm][warn] $*" >&2; }
 die() { echo "[winvm][error] $*" >&2; exit 1; }
 
-# vCPU → physical CPU pinning table for sockets=1,cores=10,threads=2 on NUMA node 1.
-# Physical core K occupies logical CPUs 10+K (HT0) and 30+K (HT1).
-# vCPU 2K = core K HT0, vCPU 2K+1 = core K HT1 — map them to real SMT sibling pairs
-# so Windows' view of SMT topology matches actual hardware cache sharing.
-VCPU_TO_PHYS=(10 30 11 31 12 32 13 33 14 34 15 35 16 36 17 37 18 38 19 39)
+# vCPU → physical CPU pinning table for sockets=1,cores=10,threads=2 spanning both NUMA nodes.
+# 5 Windows cores land on node 0 (CPUs 0-9/20-29), 5 on node 1 (CPUs 10-19/30-39), interleaved.
+# Each pair (HT0, HT1) stays on the same physical core; remaining cores on each node are host-only.
+# Windows core → physical core: 0→N0c0, 1→N1c0, 2→N0c1, 3→N1c1, 4→N0c2, 5→N1c2, 6→N0c3, 7→N1c3, 8→N0c4, 9→N1c4
+VCPU_TO_PHYS=(0 20  10 30  1 21  11 31  2 22  12 32  3 23  13 33  4 24  14 34)
 
 pin_vcpus() {
   local sock="$1" pinned=0 vcpu_id tid phys_cpu
@@ -407,24 +410,28 @@ fi
 
 machine_arg="q35"
 mem_args=(-m "$MEM")
+numa_args=()
+
+# Parse MEM into megabytes (used for hugepage validation and NUMA split calculations)
+case "${MEM^^}" in
+  *G) mem_mb=$(( ${MEM%[Gg]} * 1024 )) ;;
+  *M) mem_mb=${MEM%[Mm]} ;;
+  *)  die "Cannot parse MEM='$MEM'" ;;
+esac
 
 if [[ "$HUGEPAGES" != "0" ]]; then
   case "$HUGEPAGES" in
     2m) hp_path="/dev/hugepages"
         hp_sysfs="/sys/kernel/mm/hugepages/hugepages-2048kB"
+        hp_node_dir="hugepages-2048kB"
         hp_label="2MB" ;;
     1g) hp_path="/dev/hugepages1G"
         hp_sysfs="/sys/kernel/mm/hugepages/hugepages-1048576kB"
+        hp_node_dir="hugepages-1048576kB"
         hp_label="1GB" ;;
     *)  die "Unknown HUGEPAGES value '$HUGEPAGES' (use 2m or 1g)" ;;
   esac
 
-  # Parse MEM (e.g. 64G) and calculate how many pages are needed
-  case "${MEM^^}" in
-    *G) mem_mb=$(( ${MEM%[Gg]} * 1024 )) ;;
-    *M) mem_mb=${MEM%[Mm]} ;;
-    *)  die "Cannot parse MEM='$MEM' for huge pages calculation" ;;
-  esac
   [[ "$HUGEPAGES" == "2m" ]] && hp_needed=$(( mem_mb / 2 )) || hp_needed=$(( (mem_mb + 1023) / 1024 ))
 
   [[ -f "$hp_sysfs/free_hugepages" ]] || die "${hp_label} huge pages not available on this kernel — check CLAUDE.md for setup"
@@ -432,9 +439,48 @@ if [[ "$HUGEPAGES" != "0" ]]; then
   [[ "$hp_free" -ge "$hp_needed" ]] \
     || die "Not enough ${hp_label} huge pages: need $hp_needed, only $hp_free free. See CLAUDE.md for setup."
 
-  machine_arg="q35,memory-backend=ram"
-  mem_args=(-object "memory-backend-file,id=ram,size=${MEM},mem-path=${hp_path},prealloc=on,share=on")
-  log "Huge pages: ${hp_label} (need=${hp_needed}, free=${hp_free}, path=${hp_path})"
+  if [[ "$GUEST_NUMA" == "1" ]]; then
+    half_mb=$(( mem_mb / 2 ))
+    half_mem="${half_mb}M"
+    [[ "$HUGEPAGES" == "2m" ]] && hp_half=$(( half_mb / 2 )) || hp_half=$(( (half_mb + 1023) / 1024 ))
+    for node in 0 1; do
+      node_free=$(< "/sys/devices/system/node/node${node}/hugepages/${hp_node_dir}/free_hugepages")
+      [[ "$node_free" -ge "$hp_half" ]] \
+        || die "NUMA node $node: insufficient ${hp_label} huge pages: need $hp_half, have $node_free. Reduce MEM or set GUEST_NUMA=0."
+    done
+    mem_args=(
+      -m "$MEM"
+      -object "memory-backend-file,id=ram0,size=${half_mem},mem-path=${hp_path},prealloc=on,share=on,host-nodes=0,policy=bind"
+      -object "memory-backend-file,id=ram1,size=${half_mem},mem-path=${hp_path},prealloc=on,share=on,host-nodes=1,policy=bind"
+    )
+    log "Huge pages: ${hp_label} (need=${hp_needed}, free=${hp_free}, NUMA split: ${half_mem}/node)"
+  else
+    machine_arg="q35,memory-backend=ram"
+    mem_args=(-object "memory-backend-file,id=ram,size=${MEM},mem-path=${hp_path},prealloc=on,share=on")
+    log "Huge pages: ${hp_label} (need=${hp_needed}, free=${hp_free}, path=${hp_path})"
+  fi
+elif [[ "$GUEST_NUMA" == "1" ]]; then
+  half_mb=$(( mem_mb / 2 ))
+  half_mem="${half_mb}M"
+  mem_args=(
+    -m "$MEM"
+    -object "memory-backend-ram,id=ram0,size=${half_mem},host-nodes=0,policy=bind"
+    -object "memory-backend-ram,id=ram1,size=${half_mem},host-nodes=1,policy=bind"
+  )
+fi
+
+if [[ "$GUEST_NUMA" == "1" ]]; then
+  # Guest NUMA topology matches the interleaved VCPU_TO_PHYS pinning:
+  #   node 0: vCPUs 0,1,4,5,8,9,12,13,16,17  → physical NUMA node 0 (CPUs 0-9/20-29)
+  #   node 1: vCPUs 2,3,6,7,10,11,14,15,18,19 → physical NUMA node 1 (CPUs 10-19/30-39)
+  # Distance 21 matches the host's measured cross-NUMA latency ratio.
+  numa_args=(
+    -numa "node,nodeid=0,cpus=0-1,cpus=4-5,cpus=8-9,cpus=12-13,cpus=16-17,memdev=ram0"
+    -numa "node,nodeid=1,cpus=2-3,cpus=6-7,cpus=10-11,cpus=14-15,cpus=18-19,memdev=ram1"
+    -numa "dist,src=0,dst=1,val=21"
+    -numa "dist,src=1,dst=0,val=21"
+  )
+  log "Guest NUMA: 2 nodes × 10 vCPUs (node0↔node1 distance=21, matching host topology)"
 fi
 
 args=(
@@ -452,6 +498,7 @@ args=(
   -smbios "type=2,manufacturer=Dell Inc.,product=0NC7TW,version=A01"
   -smbios "type=3,manufacturer=Dell Inc."
   "${mem_args[@]}"
+  "${numa_args[@]}"
   -smp "$CPUS,$SMP_TOPOLOGY"
   # Data disks via virtio-scsi: rotation_rate=1 tells Windows these are non-rotating (SSD),
   # enabling SSD scheduling and higher I/O queue depth. Dedicated iothread keeps disk I/O
@@ -521,7 +568,7 @@ if [[ "$PIN_VCPUS" == "1" ]]; then
   QMP_SOCK="/tmp/qemu-vcpu-$$.qmp"
   args+=(-qmp "unix:${QMP_SOCK},server,nowait")
 
-  numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}" &
+  numactl -C "$CPU_AFFINITY" --interleave=0,1 "$QEMU_BIN" "${args[@]}" &
   QEMU_PID=$!
   # Forward SIGTERM/SIGHUP to QEMU (SIGINT propagates via shared process group).
   trap 'kill -TERM "$QEMU_PID" 2>/dev/null || true' TERM HUP
@@ -545,5 +592,5 @@ if [[ "$PIN_VCPUS" == "1" ]]; then
   wait "$QEMU_PID" || true
   rm -f "$QMP_SOCK" 2>/dev/null || true
 else
-  exec numactl -C "$CPU_AFFINITY" --preferred=1 "$QEMU_BIN" "${args[@]}"
+  exec numactl -C "$CPU_AFFINITY" --interleave=0,1 "$QEMU_BIN" "${args[@]}"
 fi

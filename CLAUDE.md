@@ -7,10 +7,11 @@
 ### Active Problem: VEP GUI lag and slow instrument loading
 
 Symptoms:
-- VEP GUI becomes unresponsive / shows "Not Responding" as template size grows
-- Instrument loading times increase as more instruments are loaded into the template
+- VEP GUI becomes unresponsive / shows "Not Responding" when interacting with large templates
+- Instrument loading times increase progressively as more instruments are loaded into the template
 - Affects all plugin types (Kontakt, Spitfire BBCO, etc.) equally
 - Occurs even when the audio engine is OFF and VEP is not connected to the DAW (so it is not a streaming/latency issue — it is a template-building/loading issue)
+- **Audio streaming is unaffected**: even with the GUI frozen/unresponsive, Cubase on the Mac can connect and stream samples flawlessly — confirms the audio engine itself is healthy; the problem is isolated to VEP's GUI/frontend
 - Running VEP on macOS (native, not in a VM) works fine — confirms this is VM-specific
 
 ### What has been ruled out
@@ -28,46 +29,19 @@ Symptoms:
 
 ### Optimizations already applied
 
-- **Huge pages (2MB)**: VM RAM backed by hugetlbfs via `memory-backend-file`; reduces EPT TLB pressure
+- **Huge pages (1GB)**: VM RAM backed by 1GB hugetlbfs pages via `memory-backend-file`; nearly eliminates EPT TLB pressure (only ~96 entries needed for the whole VM vs ~16,384 with 2MB pages). Kernel boot params `hugepagesz=1G hugepages=97` set; `/dev/hugepages1G` mounted and persisted in `/etc/fstab`. Windows memory compression disabled (`Disable-MMAgent -mc`). This improved loading speed noticeably but did not fully resolve progressive slowdown or GUI unresponsiveness.
 - **NUMA binding**: QEMU pinned to NUMA node 1 (CPUs 10–19, 30–39) via `numactl --preferred=1`
 - **Per-vCPU thread pinning**: Each of the 20 KVM vCPU threads pinned to its physical SMT sibling pair via `taskset` after launch (QMP-based thread ID discovery); SCHED_FIFO attempted but may be blocked by systemd cgroup v2 RT limits
 - **Extended Hyper-V enlightenments**: `hv_ipi`, `hv_tlbflush`, `hv_runtime`, `hv_frequencies` added on top of the original set
 - **SMI mitigation**: `ICH9-LPC.disable_s3=1` and `disable_s4=1`
 - **virtio-scsi with iothread and io_uring**: Dedicated iothread, `rotation_rate=1` for SSD identification, `aio=io_uring`
 
-### Active experiment: 1GB huge pages (reboot required)
-
-**Root cause identified**: Loading speed degrades progressively from ~20GB active guest RAM and flatlines at 32GB+. This matches EPT TLB saturation — with 2MB pages, 32GB of active memory requires ~16,384 EPT TLB entries; the hardware TLB is far smaller. With 1GB pages, only ~96 entries cover the whole VM.
-
-**Changes already made:**
-- `launch.sh`: MEM default raised 64G → 96G
-- `/etc/sysctl.d/10-hugepages.conf`: nr_hugepages raised 33000 → 49500
-
-**Pending (need to apply before next launch):**
-```bash
-# 1. Add 1GB hugepages kernel parameter
-sudo sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 hugepagesz=1G hugepages=97"/' /etc/default/grub
-sudo grub-mkconfig -o /boot/grub/grub.cfg
-# 2. Reboot host
-# 3. After reboot: mount hugetlbfs and persist
-sudo mkdir -p /dev/hugepages1G
-sudo mount -t hugetlbfs -o pagesize=1G nodev /dev/hugepages1G
-echo 'nodev /dev/hugepages1G hugetlbfs pagesize=1G 0 0' | sudo tee -a /etc/fstab
-# 4. Verify (should show 97)
-cat /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages
-```
-
-**Inside Windows after reboot:** Disable memory compression (elevated PowerShell):
-```powershell
-Disable-MMAgent -mc
-```
-Then reboot the VM once.
-
 ### Remaining hypotheses (not yet tried)
 
 - **SCHED_FIFO blocked**: `chrt` silently fails due to cgroup RT limits; vCPU threads are pinned by CPU affinity but not elevated to RT priority. Fix: set `kernel.sched_rt_runtime_us=-1` (unlimited RT, safe on a dedicated machine) or use `systemd-run --scope -p RTBandwidth=90%` to escape cgroup limits before launching
 - **Host CPU isolation**: Without `isolcpus=10-19,30-39` in kernel parameters, other host processes can still land on the pinned CPUs. Requires a reboot.
-- **VEP internal threading**: VEP may serialize plugin loading through a main coordinator thread — the bottleneck may be internal to VEP's architecture, not the VM substrate. Unknown without VEP source access.
+- **VEP GUI thread starvation**: Since audio streaming works fine with a frozen GUI, VEP's audio engine and GUI run on separate threads. The GUI thread (likely VEP's main/UI thread) may be getting starved or preempted on the vCPU it runs on. Possible avenues: confirm SCHED_FIFO is actually taking effect (check `/proc/<kvm-vcpu-tid>/sched`), or investigate whether the vCPU hosting VEP's GUI thread is being contended by other guest activity.
+- **VEP internal threading**: VEP may serialize plugin loading and GUI updates through a single coordinator thread that becomes a bottleneck as template size grows — independent of VM substrate. The progressive nature of the slowdown (gets worse as more instruments load) is consistent with this. Unknown without VEP source access; worth asking Vienna Symphonic Library support.
 - **ACPI BOCHS strings**: QEMU's ACPI tables contain `BOCHS` OEM IDs. Some software is sensitive to this; patching requires a custom QEMU build (AUR: `qemu-patched`).
 
 ### Normal launch command
@@ -95,7 +69,7 @@ This is a QEMU/KVM Windows 10 Pro VM with two purposes:
 
 ## VM Specs
 
-- **RAM**: 64GB
+- **RAM**: 96GB
 - **CPUs**: 20 (sockets=1, cores=10, threads=2)
 - **C: drive**: `win10pro.qcow2` — 250GB virtual, ~64GB actual on disk (qcow2 is sparse)
 - **Samples**: `/dev/sda` raw passthrough (virtio-scsi, cache=none, aio=io_uring, rotation_rate=1)
@@ -181,7 +155,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 | Variable | Default | Description |
 |---|---|---|
 | `IMG` | `win10pro.qcow2` | qcow2 image filename |
-| `MEM` | `64G` | VM RAM |
+| `MEM` | `96G` | VM RAM |
 | `CPUS` | `20` | vCPU count |
 | `SMP_TOPOLOGY` | `sockets=1,cores=10,threads=2` | CPU topology presented to Windows |
 | `CPU_AFFINITY` | `10-19,30-39` | numactl CPU list (NUMA node 1); memory strongly preferred on node 1 via `--preferred=1` (not `--membind` — see CPU Pinning note) |
@@ -211,7 +185,7 @@ All have defaults and can be overridden at launch time, e.g. `MEM=32G ./launch.s
 
 ## VEP Workflow
 
-1. Launch the VM with `sudo VEP_MODE=1 ./launch.sh` for optimised sample-server defaults (no QXL window, no HDA device, full 20 vCPUs). Add `HUGEPAGES=2m` if huge pages are configured on the host. Or use plain `./launch.sh` if you want the management window / audio device.
+1. Launch the VM with `sudo VEP_MODE=1 HUGEPAGES=1g ./launch.sh` for optimised sample-server defaults (no QXL window, no HDA device, full 20 vCPUs, 1GB huge pages). Or use plain `./launch.sh` if you want the management window / audio device.
 2. Windows boots; start VEP Server (64-bit) with "Advertise on local network" enabled
 3. On the Mac, open Cubase and the VEP plugin — it discovers the server by LAN broadcast
 4. Cubase routes instrument tracks to VEP Server; VEP streams audio back
@@ -242,7 +216,9 @@ Backing VM RAM with huge pages reduces EPT (Extended Page Table) TLB pressure. W
 
 The launch script validates that enough free pages exist before starting QEMU and exits with a clear error if they don't — no silent fallback.
 
-**2MB pages — recommended, allocatable at runtime:**
+**Currently in use: 1GB pages** (see Active Problem section for context on why this was chosen over 2MB).
+
+**2MB pages — simpler, allocatable at runtime:**
 
 Option A — persist across reboots via sysctl (recommended):
 ```bash
@@ -262,7 +238,7 @@ cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages  # should be ≥ 32
 
 Then launch with `HUGEPAGES=2m ./launch.sh`. hugetlbfs is mounted at `/dev/hugepages` by systemd automatically on Arch.
 
-**1GB pages** (better EPT reduction, but requires a kernel boot parameter — try 2MB first):
+**1GB pages** (currently in use — better EPT reduction, requires kernel boot parameter):
 ```bash
 # Add to GRUB_CMDLINE_LINUX in /etc/default/grub:
 #   hugepagesz=1G hugepages=65
